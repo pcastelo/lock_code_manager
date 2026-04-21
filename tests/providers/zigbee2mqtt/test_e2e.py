@@ -264,7 +264,7 @@ class TestKeypadCodeSlotEvents:
         z2m_lock,
         mqtt_bus: MqttMessageBus,
     ) -> None:
-        """Yale-style keypad payload (action_source 0) fires with slot from action_user."""
+        """Keypad payload with action_source 0 fires with slot from action_user."""
         events = _capture_bus_events(hass, EVENT_LOCK_STATE_CHANGED)
 
         mqtt_bus.fire_message(

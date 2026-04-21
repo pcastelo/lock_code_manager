@@ -68,7 +68,7 @@ class Zigbee2MQTTLock(BaseLock):
 
     @property
     def supports_code_slot_events(self) -> bool:
-        """Return True: keypad ``action_user`` maps to LCM slots (Yale / Zigbee2MQTT)."""
+        """Return True when Zigbee2MQTT reports keypad usage with an ``action_user`` slot index."""
         return True
 
     @property
@@ -165,8 +165,9 @@ class Zigbee2MQTTLock(BaseLock):
 
         Zigbee2MQTT publishes a short-lived JSON that includes ``action``, ``action_source``,
         and ``action_user``; the next update often clears those fields. We only react when
-        ``action_source`` is keypad (``0`` on Yale) or ``action_source_name`` is ``keypad``,
-        and ``action_user`` matches a slot managed by Lock Code Manager for this lock.
+        the source is keypad: ``action_source`` is ``0`` (common convention) or
+        ``action_source_name`` is ``keypad``, and ``action_user`` matches a slot managed by
+        Lock Code Manager for this lock.
         """
         action = payload.get("action")
         if action not in ("unlock", "lock", "auto_lock"):
@@ -244,8 +245,8 @@ class Zigbee2MQTTLock(BaseLock):
                     pin_code_present = "pin_code" in user_info
                     pin_raw = user_info.get("pin_code")
 
-                    # Zigbee2MQTT often omits pin_code when expose_pin is false (default on
-                    # several Yale models). Treating that as EMPTY makes the coordinator think
+                    # Zigbee2MQTT often omits pin_code when expose_pin is false on many locks.
+                    # Treating that as EMPTY makes the coordinator think
                     # the slot is cleared, so disabling the slot skips clear_usercode while the
                     # lock still holds the PIN. Only treat as EMPTY when MQTT exposes the field.
                     if status == "enabled":
