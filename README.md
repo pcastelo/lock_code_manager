@@ -23,7 +23,7 @@ Supported lock integrations:
 | Integration | Read PINs | Push Updates | Code Events | Notes |
 | --- | --- | --- | --- | --- |
 | [Z-Wave][wiki-zwave] | Varies | Yes | Yes | Some locks mask PINs |
-| [Zigbee2MQTT][wiki-zigbee2mqtt] (MQTT)² | Varies | Yes | Yes³ | Same broker as Z2M; PIN support and Z2M payloads depend on lock firmware |
+| [Zigbee2MQTT][wiki-zigbee2mqtt] (MQTT)² | Varies | Yes | Yes | — |
 | [Matter][wiki-matter] | No | Yes | Yes | PINs write-only per spec |
 | [Schlage WiFi][wiki-schlage] | No | No | No | Cloud-based, PINs masked |
 | [Akuvox][wiki-akuvox]¹ | Yes | No | No | Local API, polling-based |
@@ -38,12 +38,7 @@ The default Zigbee2MQTT base topic `zigbee2mqtt` matches what Lock Code Manager 
 (`{base_topic}/{friendly_name}/set|get`).
 During LCM setup, choose your `lock.*` entity from **MQTT**.
 If you rename the device in HA, keep it aligned with the **friendly name** in Zigbee2MQTT.
-
-³ **Code events (Zigbee2MQTT)** — Lock Code Manager emits PIN slot usage events when Zigbee2MQTT publishes a keypad
-unlock or lock and `action_user` matches a managed slot index for that lock (keypad is detected via `action_source`
-or `action_source_name`). Sources such as fingerprint or manual operation are not mapped to PIN slot events.
-Availability depends on the lock and Zigbee2MQTT exposing those fields; some MQTT updates clear `action_user`
-immediately after the action message.
+Code slot events use keypad unlock/lock payloads when `action_user` matches a managed slot.
 
 [zigbee2mqtt]: https://www.zigbee2mqtt.io/
 [wiki-akuvox]: https://github.com/raman325/lock_code_manager/wiki/Akuvox-integration
