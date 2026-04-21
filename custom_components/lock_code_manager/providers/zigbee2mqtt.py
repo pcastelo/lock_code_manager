@@ -20,6 +20,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
+from ..data import get_managed_slots
 from ..exceptions import LockDisconnected
 from ..models import SlotCode
 from ._base import BaseLock
@@ -67,8 +68,8 @@ class Zigbee2MQTTLock(BaseLock):
 
     @property
     def supports_code_slot_events(self) -> bool:
-        """Return False until Z2M lock/unlock actions map to ``async_fire_code_slot_event``."""
-        return False
+        """Return True: keypad ``action_user`` maps to LCM slots (Yale / Zigbee2MQTT)."""
+        return True
 
     @property
     def usercode_scan_interval(self) -> timedelta:
@@ -159,9 +160,54 @@ class Zigbee2MQTTLock(BaseLock):
             return False
         return True
 
+    def _maybe_fire_keypad_code_slot_event(self, payload: dict[str, Any]) -> None:
+        """Fire ``EVENT_LOCK_STATE_CHANGED`` when a managed PIN slot is used on the keypad.
+
+        Zigbee2MQTT publishes a short-lived JSON that includes ``action``, ``action_source``,
+        and ``action_user``; the next update often clears those fields. We only react when
+        ``action_source`` is keypad (``0`` on Yale) or ``action_source_name`` is ``keypad``,
+        and ``action_user`` matches a slot managed by Lock Code Manager for this lock.
+        """
+        action = payload.get("action")
+        if action not in ("unlock", "lock", "auto_lock"):
+            return
+
+        src_name = payload.get("action_source_name")
+        src = payload.get("action_source")
+        is_keypad = src == 0 or (
+            isinstance(src_name, str) and src_name.lower() == "keypad"
+        )
+        if not is_keypad:
+            return
+
+        raw_user = payload.get("action_user")
+        if raw_user is None:
+            return
+        try:
+            code_slot = int(raw_user)
+        except (TypeError, ValueError):
+            return
+
+        if code_slot not in self.managed_slots:
+            return
+
+        if action == "unlock":
+            to_locked = False
+        else:
+            to_locked = True
+
+        self.async_fire_code_slot_event(
+            code_slot=code_slot,
+            to_locked=to_locked,
+            action_text=str(action),
+            source_data=payload,
+        )
+
     @callback
     def _process_z2m_device_payload(self, payload: dict[str, Any]) -> None:
         """Apply device-topic JSON on the Home Assistant event loop."""
+        self._maybe_fire_keypad_code_slot_event(payload)
+
         # Handle pin_code added / deleted (Z2M action events, not the users object)
         if payload.get("action") in ("pin_code_added", "pin_code_deleted"):
             action_user = payload.get("action_user")
@@ -193,32 +239,24 @@ class Zigbee2MQTTLock(BaseLock):
                     )
                     continue
 
-                if not isinstance(user_info, dict):
-                    LOGGER.debug(
-                        "Skipping unexpected user_info type %s for slot %s on %s",
-                        type(user_info).__name__,
-                        user_id_str,
-                        self.lock.entity_id,
-                    )
-                    continue
+                if isinstance(user_info, dict):
+                    status = user_info.get("status")
+                    pin_code_present = "pin_code" in user_info
+                    pin_raw = user_info.get("pin_code")
 
-                status = user_info.get("status")
-                pin_code_present = "pin_code" in user_info
-                pin_raw = user_info.get("pin_code")
-
-                # Zigbee2MQTT often omits pin_code when expose_pin is false (default on
-                # several Yale models). Treating that as EMPTY makes the coordinator think
-                # the slot is cleared, so disabling the slot skips clear_usercode while the
-                # lock still holds the PIN. Only treat as EMPTY when MQTT exposes the field.
-                if status == "enabled":
-                    if _mqtt_payload_pin_has_code_value(pin_raw):
-                        updates[user_id] = str(pin_raw)
-                    elif pin_code_present:
-                        updates[user_id] = SlotCode.EMPTY
+                    # Zigbee2MQTT often omits pin_code when expose_pin is false (default on
+                    # several Yale models). Treating that as EMPTY makes the coordinator think
+                    # the slot is cleared, so disabling the slot skips clear_usercode while the
+                    # lock still holds the PIN. Only treat as EMPTY when MQTT exposes the field.
+                    if status == "enabled":
+                        if _mqtt_payload_pin_has_code_value(pin_raw):
+                            updates[user_id] = str(pin_raw)
+                        elif pin_code_present:
+                            updates[user_id] = SlotCode.EMPTY
+                        else:
+                            continue
                     else:
-                        continue
-                else:
-                    updates[user_id] = SlotCode.EMPTY
+                        updates[user_id] = SlotCode.EMPTY
 
             if updates and self.coordinator:
                 LOGGER.debug(
@@ -232,31 +270,25 @@ class Zigbee2MQTTLock(BaseLock):
         pin_code_data = payload.get("pin_code")
         if pin_code_data and isinstance(pin_code_data, dict):
             user_id = pin_code_data.get("user")
-            if user_id is None:
-                LOGGER.debug(
-                    "Ignoring pin_code payload without user field for %s",
-                    self.lock.entity_id,
-                )
-                return
+            if user_id is not None:
+                try:
+                    user_id = int(user_id)
+                except (ValueError, TypeError):
+                    LOGGER.warning(
+                        "Ignoring pin_code payload with non-numeric user for %s",
+                        self.lock.entity_id,
+                    )
+                    return
 
-            try:
-                user_id = int(user_id)
-            except (ValueError, TypeError):
-                LOGGER.warning(
-                    "Ignoring pin_code payload with non-numeric user for %s",
-                    self.lock.entity_id,
-                )
-                return
-
-            if user_id in self._pending_codes:
-                future = self._pending_codes.pop(user_id)
-                if not future.done():
-                    user_enabled = pin_code_data.get("user_enabled", False)
-                    pin_code = pin_code_data.get("pin_code")
-                    if user_enabled and _mqtt_payload_pin_has_code_value(pin_code):
-                        future.set_result(str(pin_code))
-                    else:
-                        future.set_result(None)
+                if user_id in self._pending_codes:
+                    future = self._pending_codes.pop(user_id)
+                    if not future.done():
+                        user_enabled = pin_code_data.get("user_enabled", False)
+                        pin_code = pin_code_data.get("pin_code")
+                        if user_enabled and _mqtt_payload_pin_has_code_value(pin_code):
+                            future.set_result(str(pin_code))
+                        else:
+                            future.set_result(None)
 
     async def _async_ensure_device_subscription(self) -> None:
         """Subscribe to the Z2M device topic; idempotent."""
@@ -383,7 +415,7 @@ class Zigbee2MQTTLock(BaseLock):
             raise LockDisconnected("Could not determine MQTT topic")
 
         # Get configured code slots for this lock (any LCM entry that includes this lock).
-        code_slots = self.managed_slots
+        code_slots = get_managed_slots(self.hass, self.lock.entity_id)
 
         if not code_slots:
             return {}
@@ -395,8 +427,6 @@ class Zigbee2MQTTLock(BaseLock):
         # the next. Parallel gathers plus per-slot timeouts used to raise and fail the
         # entire refresh, leaving coordinator.data empty — sync then skips every slot
         # (see SlotSyncManager._resolve_slot_state).
-        # Transient publish/timeout/read failures use UNREADABLE_CODE so sync does not
-        # treat the slot as confirmed-empty and storm reprogramming after MQTT recovery.
         for slot_num in sorted(code_slots):
             future = loop.create_future()
             self._pending_codes[slot_num] = future
@@ -424,8 +454,8 @@ class Zigbee2MQTTLock(BaseLock):
                 )
                 data[slot_num] = SlotCode.UNREADABLE_CODE
             except Exception as err:
-                LOGGER.warning(
-                    "Unexpected error getting PIN for %s slot %s: %s",
+                LOGGER.debug(
+                    "Failed to get PIN for %s slot %s: %s",
                     self.lock.entity_id,
                     slot_num,
                     err,

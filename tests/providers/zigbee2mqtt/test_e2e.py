@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import json
 
-from homeassistant.core import HomeAssistant
+from homeassistant.components.lock import LockState
+from homeassistant.core import Event, HomeAssistant, callback
 
+from custom_components.lock_code_manager.const import (
+    ATTR_CODE_SLOT,
+    ATTR_FROM,
+    ATTR_TO,
+    EVENT_LOCK_STATE_CHANGED,
+)
 from custom_components.lock_code_manager.models import SlotCode
 from custom_components.lock_code_manager.providers.zigbee2mqtt import (
     Zigbee2MQTTLock,
@@ -234,3 +241,149 @@ class TestGetUsercodes:
 
         assert result[1] == "PIN1"
         assert result[2] == "PIN2"
+
+
+def _capture_bus_events(hass: HomeAssistant, event_name: str) -> list[Event]:
+    """Capture HA bus events for assertions."""
+    events: list[Event] = []
+
+    @callback
+    def on_event(event: Event) -> None:
+        events.append(event)
+
+    hass.bus.async_listen(event_name, on_event)
+    return events
+
+
+class TestKeypadCodeSlotEvents:
+    """Keypad unlock/lock publishes ``EVENT_LOCK_STATE_CHANGED`` for managed slots."""
+
+    async def test_keypad_unlock_fires_event_for_managed_slot(
+        self,
+        hass: HomeAssistant,
+        z2m_lock,
+        mqtt_bus: MqttMessageBus,
+    ) -> None:
+        """Yale-style keypad payload (action_source 0) fires with slot from action_user."""
+        events = _capture_bus_events(hass, EVENT_LOCK_STATE_CHANGED)
+
+        mqtt_bus.fire_message(
+            Z2M_FULL_TOPIC,
+            {
+                "action": "unlock",
+                "action_source": 0,
+                "action_source_name": "keypad",
+                "action_user": 2,
+            },
+        )
+        await hass.async_block_till_done()
+        await hass.async_block_till_done()
+
+        assert len(events) == 1
+        assert events[0].data[ATTR_CODE_SLOT] == 2
+        assert events[0].data[ATTR_FROM] == LockState.LOCKED
+        assert events[0].data[ATTR_TO] == LockState.UNLOCKED
+
+    async def test_keypad_lock_event(
+        self,
+        hass: HomeAssistant,
+        z2m_lock,
+        mqtt_bus: MqttMessageBus,
+    ) -> None:
+        """Locking via keypad fires with to_locked semantics."""
+        events = _capture_bus_events(hass, EVENT_LOCK_STATE_CHANGED)
+
+        mqtt_bus.fire_message(
+            Z2M_FULL_TOPIC,
+            {
+                "action": "lock",
+                "action_source": 0,
+                "action_source_name": "keypad",
+                "action_user": 1,
+            },
+        )
+        await hass.async_block_till_done()
+        await hass.async_block_till_done()
+
+        assert len(events) == 1
+        assert events[0].data[ATTR_CODE_SLOT] == 1
+        assert events[0].data[ATTR_FROM] == LockState.UNLOCKED
+        assert events[0].data[ATTR_TO] == LockState.LOCKED
+
+    async def test_fingerprint_unlock_does_not_fire_slot_event(
+        self,
+        hass: HomeAssistant,
+        z2m_lock,
+        mqtt_bus: MqttMessageBus,
+    ) -> None:
+        """Fingerprint source must not emit PIN slot usage events."""
+        events = _capture_bus_events(hass, EVENT_LOCK_STATE_CHANGED)
+
+        mqtt_bus.fire_message(
+            Z2M_FULL_TOPIC,
+            {
+                "action": "unlock",
+                "action_source": 4,
+                "action_source_name": "fingerprint",
+                "action_user": 1,
+            },
+        )
+        await hass.async_block_till_done()
+        await hass.async_block_till_done()
+
+        assert events == []
+
+    async def test_unmanaged_slot_user_ignored(
+        self,
+        hass: HomeAssistant,
+        z2m_lock,
+        mqtt_bus: MqttMessageBus,
+    ) -> None:
+        """action_user not in LCM config slots does not fire."""
+        events = _capture_bus_events(hass, EVENT_LOCK_STATE_CHANGED)
+
+        mqtt_bus.fire_message(
+            Z2M_FULL_TOPIC,
+            {
+                "action": "unlock",
+                "action_source": 0,
+                "action_source_name": "keypad",
+                "action_user": 99,
+            },
+        )
+        await hass.async_block_till_done()
+        await hass.async_block_till_done()
+
+        assert events == []
+
+    async def test_stripped_follow_up_payload_skipped(
+        self,
+        hass: HomeAssistant,
+        z2m_lock,
+        mqtt_bus: MqttMessageBus,
+    ) -> None:
+        """Second Z2M message with null action_user does not double-fire."""
+        events = _capture_bus_events(hass, EVENT_LOCK_STATE_CHANGED)
+
+        mqtt_bus.fire_message(
+            Z2M_FULL_TOPIC,
+            {
+                "action": "unlock",
+                "action_source": 0,
+                "action_source_name": "keypad",
+                "action_user": 1,
+            },
+        )
+        mqtt_bus.fire_message(
+            Z2M_FULL_TOPIC,
+            {
+                "action_source_name": None,
+                "action_user": None,
+                "lock_state": "unlocked",
+                "state": "UNLOCK",
+            },
+        )
+        await hass.async_block_till_done()
+        await hass.async_block_till_done()
+
+        assert len(events) == 1
